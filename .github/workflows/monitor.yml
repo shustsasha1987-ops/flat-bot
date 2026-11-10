@@ -2,11 +2,12 @@ name: Мониторинг квартир
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # каждые 10 минут; сайты проверяются ~каждые 5 минут
-  workflow_dispatch:          # кнопка «Run workflow» для ручного запуска
+    - cron: "*/15 * * * *"   # запасной запуск, если цепочка прервётся
+  workflow_dispatch:          # ручной запуск и запуск следующего звена цепочки
 
 permissions:
-  contents: write             # чтобы сохранять state.json (уже отправленные объявления)
+  contents: write             # сохранять state.json
+  actions: write              # запускать следующий запуск
 
 concurrency:
   group: flat-monitor
@@ -15,7 +16,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 13
+    timeout-minutes: 58
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,17 +24,23 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Проверка сайтов и отправка в Telegram
+      - name: Проверка сайтов, кнопки, отправка в Telegram
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          RUN_SECONDS: "540"        # ~9 минут слушает кнопки, потом следующий запуск
-        run: python bot.py
+          RUN_SECONDS: "3000"       # ~50 минут бот на связи, потом сразу следующий запуск
+        run: python -u bot.py
       - name: Сохранить состояние
+        if: always()
         run: |
           git config user.name "flat-bot"
           git config user.email "flat-bot@users.noreply.github.com"
-          git add state.json
+          git add state.json || true
           git diff --cached --quiet || git commit -m "state: $(date -u +%F' '%H:%M)"
           git pull --rebase -q || true
           git push
+      - name: Запустить следующий запуск
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run monitor.yml --ref main
