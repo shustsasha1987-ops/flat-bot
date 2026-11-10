@@ -3,8 +3,9 @@
 Запускается по расписанию (GitHub Actions), за один запуск:
   1) забирает свежие объявления с трёх сайтов,
   2) фильтрует по цене, комнатам и районам (по координатам),
-  3) отправляет новые в Telegram,
-  4) запоминает отправленные в state.json.
+  3) отправляет новые в Telegram с кнопками «Думаю / Альтернатива / Отказ»,
+  4) обрабатывает нажатия кнопок (отказ — сообщение удаляется),
+  5) запоминает всё в state.json.
 """
 import html
 import json
@@ -50,6 +51,8 @@ UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit
                     "(KHTML, like Gecko) Chrome/130.0 Safari/537.36",
       "Accept-Language": "ru-RU,ru;q=0.9"}
 KEEP_DAYS = 45  # сколько дней помнить отправленные объявления
+RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "0"))  # сколько секунд слушать кнопки за один запуск
+RECHECK_SECONDS = 300  # повторная проверка сайтов внутри запуска
 
 
 def in_polygon(lon, lat, poly):
@@ -175,15 +178,42 @@ SOURCES = {"Kufar": fetch_kufar, "Onliner": fetch_onliner, "Realt": fetch_realt}
 
 
 # ---------------------------- TELEGRAM ----------------------------
+STATUS = {
+    "new": "",
+    "think": "🤔 ДУМАЮ",
+    "alt": "🔁 АЛЬТЕРНАТИВА",
+}
+BUTTONS = {  # какие кнопки показывать в каждом статусе
+    "new": [("🤔 Думаю", "think"), ("🔁 Альтернатива", "alt"), ("❌ Отказ", "reject")],
+    "think": [("🔁 В альтернативу", "alt"), ("❌ Отказ", "reject")],
+    "alt": [("🤔 В думаю", "think"), ("❌ Отказ", "reject")],
+}
+TOAST = {"think": "🤔 Думаю", "alt": "🔁 Альтернатива", "reject": "❌ Отказ — удалено"}
+
+
 def tg(method, **payload):
-    r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/{method}", data=payload, timeout=30)
-    if r.status_code == 429:
-        time.sleep(r.json().get("parameters", {}).get("retry_after", 5) + 1)
-        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/{method}", data=payload, timeout=30)
-    return r.ok
+    """Вызов Telegram API. Возвращает result или None."""
+    for _ in range(3):
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/{method}", data=payload,
+                              timeout=40)
+        except requests.RequestException:
+            time.sleep(3)
+            continue
+        if r.status_code == 429:
+            time.sleep(r.json().get("parameters", {}).get("retry_after", 5) + 1)
+            continue
+        j = r.json()
+        return j.get("result") if j.get("ok") else None
+    return None
 
 
-def card(ad, also=None):
+def keyboard(key, status):
+    rows = [[{"text": t, "callback_data": f"s|{code}|{key}"} for t, code in BUTTONS[status]]]
+    return json.dumps({"inline_keyboard": rows}, ensure_ascii=False)
+
+
+def card(ad):
     e = html.escape
     who = "👤 Собственник" if ad["owner"] else "🏢 Агентство" + (f" ({e(ad['agency'])})" if ad.get("agency") else "")
     lines = [
@@ -201,33 +231,136 @@ def card(ad, also=None):
     if ad.get("title"):
         lines.append(f"<i>{e(ad['title'][:200])}</i>")
     lines.append(f"🔗 <a href=\"{e(ad['url'])}\">{ad['source']}</a>")
-    if also:
-        lines.append("Также на: " + ", ".join(also))
     return "\n".join(lines)
 
 
-def send(ad):
+def with_status(text, status):
+    label = STATUS.get(status, "")
+    return f"<b>{label}</b>\n{text}" if label else text
+
+
+def send(key, ad):
+    """Отправляет карточку с кнопками, возвращает запись для state или None."""
     text = card(ad)
-    if ad.get("photo") and len(text) < 1000:
-        if tg("sendPhoto", chat_id=TG_CHAT, photo=ad["photo"], caption=text, parse_mode="HTML"):
-            return True
-    return tg("sendMessage", chat_id=TG_CHAT, text=text, parse_mode="HTML",
-              disable_web_page_preview="false")
+    kb = keyboard(key, "new")
+    if ad.get("photo") and len(text) < 950:
+        res = tg("sendPhoto", chat_id=TG_CHAT, photo=ad["photo"], caption=text,
+                 parse_mode="HTML", reply_markup=kb)
+        if res:
+            return {"msg": res["message_id"], "photo": True, "text": text, "status": "new"}
+    res = tg("sendMessage", chat_id=TG_CHAT, text=text, parse_mode="HTML", reply_markup=kb)
+    if res:
+        return {"msg": res["message_id"], "photo": False, "text": text, "status": "new"}
+    return None
+
+
+def edit(rec, key):
+    body = with_status(rec["text"], rec["status"])
+    common = dict(chat_id=TG_CHAT, message_id=rec["msg"], parse_mode="HTML",
+                  reply_markup=keyboard(key, rec["status"]))
+    if rec["photo"]:
+        return tg("editMessageCaption", caption=body, **common)
+    return tg("editMessageText", text=body, **common)
+
+
+def reject(rec):
+    if tg("deleteMessage", chat_id=TG_CHAT, message_id=rec["msg"]):
+        return
+    # Telegram не даёт удалить (например, сообщение старше 48 ч) — сворачиваем
+    first = rec["text"].split("\n")[0]
+    body = f"❌ <s>Отказ</s> · {first}"
+    common = dict(chat_id=TG_CHAT, message_id=rec["msg"], parse_mode="HTML",
+                  reply_markup=json.dumps({"inline_keyboard": []}))
+    if rec["photo"]:
+        tg("editMessageCaption", caption=body, **common)
+    else:
+        tg("editMessageText", text=body, **common)
+
+
+def send_list(st):
+    groups = {"think": [], "alt": []}
+    for key, rec in st["ads"].items():
+        if rec.get("status") in groups:
+            first = re.sub(r"<[^>]+>", "", rec["text"].split("\n")[0])
+            addr = re.sub(r"<[^>]+>", "", rec["text"].split("\n")[1]) if "\n" in rec["text"] else ""
+            groups[rec["status"]].append(f"• {first} — {addr.replace('📍 ', '')} "
+                                         f"<a href=\"{html.escape(rec.get('url', ''))}\">ссылка</a>")
+    parts = []
+    for status, title in (("think", "🤔 Думаю"), ("alt", "🔁 Альтернатива")):
+        items = groups[status]
+        parts.append(f"<b>{title} ({len(items)})</b>\n" + ("\n".join(items) if items else "— пусто"))
+    tg("sendMessage", chat_id=TG_CHAT, text="\n\n".join(parts), parse_mode="HTML",
+       disable_web_page_preview="true")
+
+
+HELP = ("Кнопки под объявлением:\n"
+        "🤔 Думаю — звоню и рассматриваю в первую очередь\n"
+        "🔁 Альтернатива — во вторую очередь\n"
+        "❌ Отказ — объявление удаляется из чата и больше не появится\n\n"
+        "Статус можно менять в любой момент кнопками под объявлением.\n"
+        "/list — список «Думаю» и «Альтернатива»")
+
+
+def process_updates(st, wait=0):
+    """Читает нажатия кнопок и команды. wait — сколько секунд ждать новых событий."""
+    res = tg("getUpdates", offset=st.get("offset", 0), timeout=wait,
+             allowed_updates=json.dumps(["callback_query", "message"]))
+    if res is None and wait:
+        time.sleep(5)  # Telegram недоступен — не долбим API
+    if not res:
+        return
+    for u in res:
+        st["offset"] = u["update_id"] + 1
+        cq = u.get("callback_query")
+        if cq:
+            if str(cq.get("from", {}).get("id")) != str(TG_CHAT):
+                continue
+            try:
+                _, code, key = cq.get("data", "").split("|", 2)
+            except ValueError:
+                continue
+            rec = st["ads"].get(key)
+            if not rec:
+                tg("answerCallbackQuery", callback_query_id=cq["id"], text="Объявление не найдено")
+                continue
+            if code == "reject":
+                reject(rec)
+                rec["status"] = "reject"
+            elif code in ("think", "alt"):
+                rec["status"] = code
+                edit(rec, key)
+            rec["changed"] = time.time()
+            tg("answerCallbackQuery", callback_query_id=cq["id"], text=TOAST.get(code, "Готово"))
+            continue
+        msg = u.get("message") or {}
+        if str(msg.get("chat", {}).get("id")) != str(TG_CHAT):
+            continue
+        text = (msg.get("text") or "").strip().lower()
+        if text.startswith("/list"):
+            send_list(st)
+        elif text.startswith("/start") or text.startswith("/help"):
+            tg("sendMessage", chat_id=TG_CHAT, text=HELP)
 
 
 # ---------------------------- ОСНОВНОЙ ЦИКЛ ----------------------------
 def load_state():
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
+            st = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"seen": {}, "fingerprints": {}, "errors": {}, "initialized": False}
+        st = {}
+    for k, v in (("seen", {}), ("fingerprints", {}), ("errors", {}), ("ads", {})):
+        st.setdefault(k, v)
+    return st
 
 
 def save_state(st):
     now = time.time()
     for key in ("seen", "fingerprints"):
         st[key] = {k: v for k, v in st[key].items() if now - v < KEEP_DAYS * 86400}
+    # «Думаю» и «Альтернатива» храним всегда, остальное — KEEP_DAYS
+    st["ads"] = {k: v for k, v in st["ads"].items()
+                 if v.get("status") in ("think", "alt") or k in st["seen"]}
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(st, f, ensure_ascii=False, indent=0, sort_keys=True)
 
@@ -239,13 +372,7 @@ def fingerprint(ad):
     return f"{round(ad['lat'], 3)}:{round(ad['lon'], 3)}:{ad['rooms']}:{round(ad['price'] / 20)}"
 
 
-def main():
-    dry = "--dry" in sys.argv
-    if not dry and not (TG_TOKEN and TG_CHAT):
-        sys.exit("Не заданы TELEGRAM_TOKEN / TELEGRAM_CHAT_ID")
-    st = load_state()
-    st.setdefault("errors", {})
-    now = time.time()
+def collect(st, dry=False):
     matched = []
     for name, fn in SOURCES.items():
         try:
@@ -265,20 +392,14 @@ def main():
             ad["zone"] = zone_of(ad["lon"], ad["lat"])
             if ad["zone"]:
                 matched.append(ad)
+    return matched
 
-    first_run = not st.get("initialized")
+
+def check_sites(st):
+    now = time.time()
+    matched = collect(st)
     new = [a for a in matched if f"{a['source']}:{a['id']}" not in st["seen"]]
     print(f"Подходит под фильтр: {len(matched)}, новых: {len(new)}")
-
-    if dry:
-        for a in new:
-            print("-" * 40); print(card(a))
-        return
-
-    if first_run:
-        tg("sendMessage", chat_id=TG_CHAT, parse_mode="HTML",
-           text="✅ Бот запущен. Присылаю всё, что сейчас подходит под фильтр (без дублей между сайтами). "
-                "Дальше буду присылать только новые.")
     sent = 0
     for ad in new:
         key = f"{ad['source']}:{ad['id']}"
@@ -286,16 +407,58 @@ def main():
         if fp and fp in st["fingerprints"]:
             st["seen"][key] = now  # дубль с другого сайта — не шлём повторно
             continue
-        if send(ad):
-            sent += 1
+        rec = send(key, ad)
+        if rec:
+            rec["url"] = ad["url"]
+            st["ads"][key] = rec
             st["seen"][key] = now
             if fp:
                 st["fingerprints"][fp] = now
+            sent += 1
             time.sleep(1.1)
-    st["initialized"] = True
+    print(f"Отправлено: {sent}")
+
+
+def migrate(st):
+    """Переход на версию с кнопками: убираем старые сообщения без кнопок и шлём всё заново."""
+    if st.get("version", 1) >= 2:
+        return
+    probe = tg("sendMessage", chat_id=TG_CHAT, text="🔄 Обновляю бота…")
+    if probe:
+        last = probe["message_id"]
+        for mid in range(last, max(0, last - 300), -1):
+            tg("deleteMessage", chat_id=TG_CHAT, message_id=mid)
+    st["seen"], st["fingerprints"], st["ads"] = {}, {}, {}
+    st["version"] = 2
+    tg("sendMessage", chat_id=TG_CHAT,
+       text="✅ Бот обновлён: теперь под каждым объявлением есть кнопки. Присылаю заново всё актуальное.\n\n" + HELP)
+
+
+def main():
+    if "--dry" in sys.argv:
+        st = load_state()
+        for a in collect(st, dry=True):
+            print("-" * 40); print(card(a))
+        return
+    if not (TG_TOKEN and TG_CHAT):
+        sys.exit("Не заданы TELEGRAM_TOKEN / TELEGRAM_CHAT_ID")
+    start = time.time()
+    st = load_state()
+    process_updates(st)            # нажатия, накопившиеся между запусками
+    migrate(st)
+    check_sites(st)
+    next_check = start + RECHECK_SECONDS
+    # слушаем кнопки до конца отведённого времени, по пути ещё раз проверяем сайты
+    while time.time() - start < RUN_SECONDS - 5:
+        wait = int(min(25, RUN_SECONDS - (time.time() - start) - 3))
+        if wait <= 0:
+            break
+        process_updates(st, wait=wait)
+        if time.time() >= next_check:
+            check_sites(st)
+            next_check += RECHECK_SECONDS
     st["last_run"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     save_state(st)
-    print(f"Отправлено: {sent}")
 
 
 if __name__ == "__main__":
